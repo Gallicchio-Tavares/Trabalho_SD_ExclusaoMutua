@@ -30,6 +30,8 @@ logging.basicConfig(
 
 def log_event(event):
     logging.info(event)
+    # Opcional: imprimir no terminal também para debug
+    # print(event)
 
 
 # ---------------------
@@ -38,11 +40,27 @@ def log_event(event):
 def connection_thread(sock):
     while True:
         client_socket, addr = sock.accept()
-        pid = int(client_socket.recv(F).decode().split(SEP)[1])
-        with lock:
-            clients[pid] = client_socket
-            served_count.setdefault(pid, 0)
-        log_event(f"Novo processo conectado: PID {pid}")
+        
+        client_socket.setblocking(True)
+        try:
+            data = client_socket.recv(F)
+            if not data:
+                client_socket.close()
+                continue
+            
+            pid = int(data.decode().split(SEP)[1])
+            
+            # mudando pra NÃO-BLOQUEANTE
+            client_socket.setblocking(False)
+            
+            with lock:
+                clients[pid] = client_socket
+                served_count.setdefault(pid, 0)
+            log_event(f"Novo processo conectado: PID {pid}")
+            
+        except Exception as e:
+            print(f"Erro na conexão inicial: {e}")
+            client_socket.close()
 
 
 # ---------------------
@@ -50,55 +68,77 @@ def connection_thread(sock):
 # ---------------------
 def logic_thread():
     while True:
-        # Verificar mensagens de todos os processos
+        # ver msgs de todos os processos
         with lock:
             active_clients = list(clients.items())
 
         for pid, client_socket in active_clients:
             try:
                 data = client_socket.recv(F)
+                
+                # tratando desconexão
                 if not data:
+                    with lock:
+                        if pid in clients:
+                            print(f"Detectada desconexão do PID {pid}")
+                            clients[pid].close()
+                            del clients[pid]
                     continue
+
+                msg_id, sender_pid = parse_message(data)
+                log_event(f"RECEBIDO | PID {sender_pid} | MSG {msg_id}")
+
+                if msg_id == MSG_REQUEST:
+                    request_queue.put(sender_pid)
+
+                    # Se for o único na fila -> envia GRANT imediatamente
+                    if request_queue.qsize() == 1:
+                        send_grant(sender_pid)
+
+                elif msg_id == MSG_RELEASE:
+                    if not request_queue.empty():
+                        finished_pid = request_queue.get()
+                        served_count[finished_pid] += 1
+
+                    # Se ainda há alguém na fila, envia GRANT para o próximo
+                    if not request_queue.empty():
+                        next_pid = request_queue.queue[0]
+                        send_grant(next_pid)
+
             except BlockingIOError:
+                # Normal para sockets não-bloqueantes quando não há dados
                 continue
             except ConnectionResetError:
+                # Cliente caiu abruptamente
+                with lock:
+                    if pid in clients:
+                        clients[pid].close()
+                        del clients[pid]
                 continue
-
-            msg_id, sender_pid = parse_message(data)
-            log_event(f"RECEBIDO | PID {sender_pid} | MSG {msg_id}")
-
-            if msg_id == MSG_REQUEST:
-                request_queue.put(sender_pid)
-
-                # Se for o único na fila → envia GRANT
-                if request_queue.qsize() == 1:
-                    send_grant(sender_pid)
-
-            elif msg_id == MSG_RELEASE:
-                finished_pid = request_queue.get()
-                served_count[finished_pid] += 1
-
-                # Próximo da fila
-                if not request_queue.empty():
-                    next_pid = request_queue.queue[0]
-                    send_grant(next_pid)
-
 
 
 def send_grant(pid):
     with lock:
-        sock = clients[pid]
-    msg = build_message(MSG_GRANT, pid)
-    sock.send(msg)
-    log_event(f"ENVIADO | PID {pid} | GRANT")
+        if pid in clients:
+            sock = clients[pid]
+            try:
+                msg = build_message(MSG_GRANT, pid)
+                sock.send(msg)
+                log_event(f"ENVIADO | PID {pid} | GRANT")
+            except Exception as e:
+                print(f"Erro ao enviar GRANT para {pid}: {e}")
 
 
 # ---------------------
 # Thread 3: Interface
 # ---------------------
 def interface_thread():
+    print("Interface ativa. Comandos: fila, atendidos, exit")
     while True:
-        cmd = input().strip()
+        try:
+            cmd = input().strip()
+        except EOFError:
+            break
 
         if cmd == "fila":
             with lock:
@@ -110,6 +150,7 @@ def interface_thread():
 
         elif cmd == "exit":
             print("Encerrando coordenador...")
+            # Idealmente fecharia sockets aqui, mas o OS limpa ao matar o processo
             break
 
 
@@ -117,11 +158,13 @@ def interface_thread():
 # Main
 # ---------------------
 def main():
-    server = socket.socket()
+    # usando agr o SO_REUSEADDR pra evitar erro de "Address already in use" qnd reinicia rápido
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, PORT))
     server.listen()
 
-    print("Coordenador iniciado.")
+    print(f"Coordenador iniciado em {HOST}:{PORT}.")
 
     threading.Thread(target=connection_thread, args=(server,), daemon=True).start()
     threading.Thread(target=logic_thread, daemon=True).start()
