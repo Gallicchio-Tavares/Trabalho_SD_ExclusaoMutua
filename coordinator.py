@@ -89,20 +89,29 @@ def logic_thread():
                 log_event(f"RECEBIDO | PID {sender_pid} | MSG {msg_id}")
 
                 if msg_id == MSG_REQUEST:
-                    request_queue.put(sender_pid)
-
-                    # Se for o único na fila -> envia GRANT imediatamente
-                    if request_queue.qsize() == 1:
+                    # Verifica se a fila estava vazia ANTES de inserir
+                    with lock:
+                        was_empty = request_queue.empty()
+                        request_queue.put(sender_pid)
+                    
+                    # Se estava vazia, pode enviar GRANT imediatamente
+                    if was_empty:
                         send_grant(sender_pid)
 
                 elif msg_id == MSG_RELEASE:
-                    if not request_queue.empty():
-                        finished_pid = request_queue.get()
-                        served_count[finished_pid] += 1
+                    next_pid = None
+                    with lock:
+                        if not request_queue.empty():
+                            finished_pid = request_queue.get()
+                            served_count[finished_pid] = served_count.get(finished_pid, 0) + 1
 
-                    # Se ainda há alguém na fila, envia GRANT para o próximo
-                    if not request_queue.empty():
-                        next_pid = request_queue.queue[0]
+                        # Se ainda há alguém na fila, pega o próximo
+                        if not request_queue.empty():
+                            # Pega o próximo sem remover da fila
+                            next_pid = request_queue.queue[0]
+                    
+                    # Envia GRANT fora do lock (para evitar deadlock)
+                    if next_pid is not None:
                         send_grant(next_pid)
 
             except BlockingIOError:
@@ -150,7 +159,13 @@ def interface_thread():
 
         elif cmd == "exit":
             print("Encerrando coordenador...")
-            # Idealmente fecharia sockets aqui, mas o OS limpa ao matar o processo
+            # Fecha todos os sockets antes de sair
+            with lock:
+                for pid, sock in clients.items():
+                    try:
+                        sock.close()
+                    except:
+                        pass
             break
 
 
